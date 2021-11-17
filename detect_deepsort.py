@@ -14,12 +14,16 @@ from utils.google_utils import attempt_load
 from utils.datasets import LoadStreams, LoadImages
 from utils.general import (
     check_img_size, non_max_suppression, apply_classifier, scale_coords, xyxy2xywh, strip_optimizer)
-from utils.plots import plot_one_box
+from utils.plots import plot_one_box, Annotator
 from utils.torch_utils import select_device, load_classifier, time_synchronized
 
 from models.models import *
 from utils.datasets import *
 from utils.general import *
+
+from deep_sort_pytorch.utils.parser import get_config
+from deep_sort_pytorch.deep_sort import DeepSort
+
 
 def load_classes(path):
     # Loads *.names file at 'path'
@@ -28,9 +32,13 @@ def load_classes(path):
     return list(filter(None, names))  # filter removes empty strings (such as last line)
 
 def detect(save_img=False):
-    out, source, weights, view_img, save_txt, imgsz, cfg, names = \
-        opt.output, opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size, opt.cfg, opt.names
+    out, source, weights, view_img, save_txt, save_all_txt, imgsz, cfg, names = opt.output, opt.source, opt.weights, opt.view_img, opt.save_txt, opt.save_all_txt, opt.img_size, opt.cfg, opt.names
     webcam = source == '0' or source.startswith('rtsp') or source.startswith('http') or source.endswith('.txt')
+
+    if save_all_txt:
+        save_all_txt = f"inference/dets/{save_all_txt}.txt"
+        if os.path.exists(save_all_txt):
+            os.remove(save_all_txt)
 
     # Initialize
     device = select_device(opt.device)
@@ -47,6 +55,15 @@ def detect(save_img=False):
     model.to(device).eval()
     if half:
         model.half()  # to FP16
+    cfg = get_config()
+    cfg.merge_from_file(opt.config_deepsort)
+
+    deepsort = DeepSort(cfg.DEEPSORT.REID_CKPT,
+                        max_dist=cfg.DEEPSORT.MAX_DIST, min_confidence=cfg.DEEPSORT.MIN_CONFIDENCE,
+                        max_iou_distance=cfg.DEEPSORT.MAX_IOU_DISTANCE,
+                        max_age=cfg.DEEPSORT.MAX_AGE, n_init=cfg.DEEPSORT.N_INIT, nn_budget=cfg.DEEPSORT.NN_BUDGET,
+                        use_cuda=True)
+
 
     # Second-stage classifier
     classify = False
@@ -71,9 +88,11 @@ def detect(save_img=False):
 
     # Run inference
     t0 = time.time()
+    tfps = time_synchronized()
     img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
     _ = model(img.half() if half else img) if device.type != 'cpu' else None  # run once
-    for path, img, im0s, vid_cap in dataset:
+    for frame_idx, (path, img, im0s, vid_cap) in enumerate(dataset):
+        frame_idx += 1
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -91,7 +110,6 @@ def detect(save_img=False):
         # Apply Classifier
         if classify:
             pred = apply_classifier(pred, modelc, img, im0s)
-
         # Process detections
         for i, det in enumerate(pred):  # detections per image
             if webcam:  # batch_size >= 1
@@ -100,36 +118,81 @@ def detect(save_img=False):
                 p, s, im0 = path, '', im0s
 
             save_path = str(Path(out) / Path(p).name)
+            annotator = Annotator(im0, line_width=2, pil=not ascii)
+
             txt_path = str(Path(out) / Path(p).stem) + ('_%g' % dataset.frame if dataset.mode == 'video' else '')
             s += '%gx%g ' % img.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape)
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += '%g %ss, ' % (n, names[int(c)])  # add to string
+                xywhs = xyxy2xywh(det[:, 0:4])
+                confs = det[:, 4]
+                clss = det[:, 5]
+                t4 = time_synchronized()
+                
+                outputs = deepsort.update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
+                real_fps = 1/(time_synchronized() - tfps)
+                tfps = time_synchronized()
+                t5 = time_synchronized()
+                # draw boxes for visualization
+                if frame_idx == 1:
+                    print(frame_idx, outputs)
+                if len(outputs) > 0:
+                    for j, (output, conf) in enumerate(zip(outputs, confs)): 
+                        
+                        bboxes = output[0:4]
+                        id = int(output[4])
+                        cls = int(output[5])
 
-                # Write results
-                for *xyxy, conf, cls in det:
-                    if int(cls) != 0:
-                        #print("Class:",names[int(cls)],"-->",int(cls))
-                        continue
-                    if save_txt:  # Write to file
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        with open(txt_path + '.txt', 'a') as f:
-                            f.write(('%g ' * 5 + '\n') % (cls, *xywh))  # label format
-                    if save_img or view_img:  # Add bbox to image
-                        label = '%s %.2f' % (names[int(cls)], conf)
-                        plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
+                        c = int(cls)  # integer class
+                        label = f'{id} {names[c]} {conf:.2f}'
+                        annotator.box_label(bboxes, label, color=colors[c])
+
+                        if save_txt or save_all_txt:
+                            # to MOT format
+                            bbox_left = output[0]
+                            bbox_top = output[1]
+                            bbox_w = output[2] - output[0]
+                            bbox_h = output[3] - output[1]
+                            # Write MOT compliant results to file
+                            motDetRow = f'{frame_idx},{id},{bbox_left:.2f},{bbox_top:.2f},{bbox_w:.2f},{bbox_h:.2f},-1,-1,-1,-1\n'
+                            if save_txt:
+                                with open(txt_path, 'a') as f:
+                                    f.write(motDetRow)  # label format
+                            if save_all_txt:
+                                with open(save_all_txt, 'a') as f:
+                                    f.write(motDetRow)  # label format
+                else:
+                    # Write results
+                    for *xyxy, conf, cls in det:
+                        if save_txt or save_all_txt:  # Write to file
+                            xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                            bbox_left = xyxy[0]
+                            bbox_top = xyxy[1]
+                            bbox_w = xyxy[2]
+                            bbox_h = xyxy[3]
+                            motDetRow = f'{frame_idx},-1,{bbox_left:.2f},{bbox_top:.2f},{bbox_w:.2f},{bbox_h:.2f},-1,-1,-1,-1\n'
+                            if save_txt:
+                                with open(txt_path + '.txt', 'a') as f:
+                                    f.write(motDetRow)  # label format
+                            if save_all_txt:
+                                with open(save_all_txt, 'a') as f:
+                                    f.write(motDetRow)  # label format
+            else:
+                deepsort.increment_ages()
 
             # Print time (inference + NMS)
-            print('%sDone. Inference: (%.4fs), NMS: (%.4fs), Total: (%.3fs)' % (s, t2 - t1, t3 - t2, t3 - t1))
-
+            print('%sDone. Inference: (%.4fs), NMS: (%.4fs), Deep sort: (%.3fs), FPS: (%.3fs), LOOP FPS: (%.3fs)' % (s, t2 - t1, t3 - t2, t5 - t4, (1/(t5-t1)), real_fps))
+            im0 = annotator.result()
             # Stream results
             if view_img:
-                cv2.imshow(p, im0)
+                t6 = time_synchronized()
+                cv2.imshow(save_all_txt, im0)
                 if cv2.waitKey(1) == ord('q'):  # q to quit
                     raise StopIteration
 
@@ -169,12 +232,16 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
+    parser.add_argument('--save-all-txt', type=str, help='save all results to *.txt')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --class 0, or --class 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--update', action='store_true', help='update all models')
     parser.add_argument('--cfg', type=str, default='cfg/yolor_p6.cfg', help='*.cfg path')
     parser.add_argument('--names', type=str, default='data/coco.names', help='*.cfg path')
+    #parser.add_argument('--deep_sort_weights', type=str, default='deep_sort_pytorch/deep_sort/deep/checkpoint/ckpt.t7', help='ckpt.t7 path')
+    parser.add_argument('--config_deepsort', type=str, default='deep_sort_pytorch/configs/deep_sort.yaml')
+
     opt = parser.parse_args()
     print(opt)
 
