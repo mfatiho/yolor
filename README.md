@@ -1,6 +1,6 @@
-# YOLOR + Deep Sort with PyTorch
+# YOLOR + Deep Sort
 
-Object tracking was performed by combining Yolor and the deep sort pytorch algorithm in Yolov5.
+Object tracking was performed by combining [Yolor](https://github.com/WongKinYiu/yolor) and the [deep sort pytorch algorithm in Yolov5](https://github.com/mikel-brostrom/Yolov5_DeepSort_Pytorch).
 
 The [MOT16](https://motchallenge.net/data/MOT16/) dataset was used as the dataset.
 
